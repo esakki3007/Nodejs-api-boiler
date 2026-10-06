@@ -1,0 +1,2 @@
+Required dependency: p-limit
+Install if not already present: npm install p-limit
