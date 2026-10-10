@@ -1,75 +1,99 @@
-export type ScreeningGroup = 'MR' | 'ERGO';
+import { WebcheckAdapterFactory } from './webcheck/adapters/webcheck-adapter.factory';
+import { PaymentAdapterFactory } from './payment/adapters/payment-adapter.factory';
 
-export type ScreeningType = 'WEBCHECK' | 'PAYMENT';
+import { WebcheckNetRevealService } from './webcheck/webcheck-netreveal.service';
+import { PaymentNetRevealService } from './payment/payment-netreveal.service';
 
-export type ScreeningLanguage = 'en' | 'de';
+type ScreeningGroup = 'MR' | 'ERGO';
+type ScreeningType = 'WEBCHECK' | 'PAYMENT';
+type Language = 'en' | 'de';
 
-export interface ScreeningBatch {
+interface ScreeningContext {
   group: ScreeningGroup;
   screeningType: ScreeningType;
   language: string;
-  orgUnit: string;
-  Embargo: boolean;
-  PEP: boolean;
 }
 
 export class ScreeningOrchestrator {
   constructor(
-    private readonly webcheckServiceFactory: WebcheckScreeningServiceFactory,
-    private readonly paymentServiceFactory: PaymentScreeningServiceFactory,
     private readonly webcheckAdapterFactory: WebcheckAdapterFactory,
     private readonly paymentAdapterFactory: PaymentAdapterFactory,
+    private readonly webcheckNetRevealService: WebcheckNetRevealService,
+    private readonly paymentNetRevealService: PaymentNetRevealService,
   ) {}
 
-  async screen(batch: ScreeningBatch, record: Record<string, unknown>) {
-    const language = batch.language.toLowerCase();
+  async screen(
+    context: ScreeningContext,
+    record: Record<string, unknown>,
+  ) {
+    const group = context.group.toUpperCase();
+    const language = context.language.toLowerCase();
 
-    if (batch.group === 'MR' && language !== 'en') {
-      throw new Error('MR supports English only');
+    // 1. Validate the group and language.
+    if (group !== 'MR' && group !== 'ERGO') {
+      throw new Error(`Unsupported screening group: ${group}`);
     }
 
-    const adapter =
-      batch.screeningType === 'WEBCHECK'
-        ? this.webcheckAdapterFactory.getAdapter(
-            batch.group,
-            language,
-          )
-        : this.paymentAdapterFactory.getAdapter(
-            batch.group,
-            language,
+    if (language !== 'en' && language !== 'de') {
+      throw new Error(`Unsupported language: ${language}`);
+    }
+
+    // 2. MR supports English Webcheck screening only.
+    if (group === 'MR' &&
+        (language !== 'en' || context.screeningType !== 'WEBCHECK')) {
+      throw new Error(
+        'MR supports English Webcheck screening only',
+      );
+    }
+
+    // 3. Select the appropriate adapter and service.
+    switch (context.screeningType) {
+      case 'WEBCHECK': {
+        const adapter =
+          this.webcheckAdapterFactory.getAdapter(
+            group,
+            language as Language,
           );
 
-    const service =
-      batch.screeningType === 'WEBCHECK'
-        ? this.webcheckServiceFactory.getService(
-            batch.group,
-            language,
-          )
-        : this.paymentServiceFactory.getService(
-            batch.group,
-            language,
+        const canonicalRequest =
+          await adapter.toCanonical(record);
+
+        const canonicalResponse =
+          await this.webcheckNetRevealService.webCheckScreen(
+            canonicalRequest,
           );
 
-    const lowerCaseRecord = Object.fromEntries(
-      Object.entries(record).map(([key, value]) => [
-        key.toLowerCase(),
-        value,
-      ]),
-    );
+        return adapter.toResponse(canonicalResponse);
+      }
 
-    const request = {
-      ...lowerCaseRecord,
-      orgUnitId: batch.orgUnit,
-      embargo: batch.Embargo,
-      pep: batch.PEP,
-    };
+      case 'PAYMENT': {
+        if (group !== 'ERGO') {
+          throw new Error(
+            'Payment screening is supported only for ERGO',
+          );
+        }
 
-    const canonicalRequest = await adapter.toCanonical(request);
+        const adapter =
+          this.paymentAdapterFactory.getAdapter(
+            group,
+            language as Language,
+          );
 
-    const canonicalResponse = await service.screen(
-      canonicalRequest,
-    );
+        const canonicalRequest =
+          await adapter.toCanonical(record);
 
-    return adapter.toResponse(canonicalResponse);
+        const canonicalResponse =
+          await this.paymentNetRevealService.paymentScreen(
+            canonicalRequest,
+          );
+
+        return adapter.toResponse(canonicalResponse);
+      }
+
+      default:
+        throw new Error(
+          `Unsupported screening type: ${context.screeningType}`,
+        );
+    }
   }
 }
