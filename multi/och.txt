@@ -97,3 +97,87 @@ export class ScreeningOrchestrator {
     }
   }
 }
+
+
+----------------
+
+import { ScreeningOrchestrator } from './ScreeningOrchestrator';
+
+import { WebcheckAdapterFactory } from
+  '../../modules/webcheck/adapters/webcheck-adapter.factory';
+
+import { PaymentAdapterFactory } from
+  '../../modules/payment/adapters/payment-adapter.factory';
+
+// Import your existing service and dependency classes.
+import { WebcheckScreeningService } from
+  '../../modules/webcheck/webcheck-screening.service';
+
+import { PaymentScreeningService } from
+  '../../modules/payment/payment-screening.service';
+
+import { NetRevealWebcheckScreeningClient } from
+  '../../modules/webcheck/netreveal-webcheck-screening.client';
+
+import { UndiciHttpClient } from
+  '../../infrastructure/http/undici-http-client';
+
+import { NetRevealAuthService } from
+  '../../modules/netreveal/netreveal-auth.service';
+
+import { WebcheckRequestMapper } from
+  '../../modules/webcheck/webcheck-request.mapper';
+
+import { WebcheckResponseMapper } from
+  '../../modules/webcheck/webcheck-response.mapper';
+
+// Import the actual payment dependencies from your project.
+
+export function createScreeningOrchestrator(): ScreeningOrchestrator {
+  const httpClient = new UndiciHttpClient(
+    env.NETREVEAL_BASE_URL,
+  );
+
+  const authService = new NetRevealAuthService();
+
+  const webcheckService = new WebcheckScreeningService(
+    new NetRevealWebcheckScreeningClient(
+      httpClient,
+      authService,
+    ),
+    new WebcheckRequestMapper(),
+    new WebcheckResponseMapper(),
+  );
+
+  const paymentService = new PaymentScreeningService(
+    // Add the same dependencies currently used
+    // by your PaymentScreeningService constructor.
+  );
+
+  return new ScreeningOrchestrator(
+    new WebcheckAdapterFactory(),
+    new PaymentAdapterFactory(),
+    webcheckService,
+    paymentService,
+  );
+}
+
+------------========
+export class BatchRecordProcessor {
+  private readonly screeningOrchestrator: ScreeningOrchestrator;
+
+  constructor() {
+    this.screeningOrchestrator = createScreeningOrchestrator();
+  }
+
+  private async processRecord(batch: Batch, record: Record<string, unknown>) {
+    return this.screeningOrchestrator.screen(
+      {
+        group: batch.group,
+        screeningType: batch.screeningType,
+        language: batch.language,
+      },
+      record,
+    );
+  }
+}
