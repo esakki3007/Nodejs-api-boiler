@@ -1,183 +1,39 @@
-import { WebcheckAdapterFactory } from './webcheck/adapters/webcheck-adapter.factory';
-import { PaymentAdapterFactory } from './payment/adapters/payment-adapter.factory';
 
-import { WebcheckNetRevealService } from './webcheck/webcheck-netreveal.service';
-import { PaymentNetRevealService } from './payment/payment-netreveal.service';
-
-type ScreeningGroup = 'MR' | 'ERGO';
-type ScreeningType = 'WEBCHECK' | 'PAYMENT';
-type Language = 'en' | 'de';
-
-interface ScreeningContext {
-  group: ScreeningGroup;
-  screeningType: ScreeningType;
-  language: string;
-}
-
-export class ScreeningOrchestrator {
-  constructor(
-    private readonly webcheckAdapterFactory: WebcheckAdapterFactory,
-    private readonly paymentAdapterFactory: PaymentAdapterFactory,
-    private readonly webcheckNetRevealService: WebcheckNetRevealService,
-    private readonly paymentNetRevealService: PaymentNetRevealService,
-  ) {}
-
-  async screen(
-    context: ScreeningContext,
-    record: Record<string, unknown>,
-  ) {
-    const group = context.group.toUpperCase();
-    const language = context.language.toLowerCase();
-
-    // 1. Validate the group and language.
-    if (group !== 'MR' && group !== 'ERGO') {
-      throw new Error(`Unsupported screening group: ${group}`);
-    }
-
-    if (language !== 'en' && language !== 'de') {
-      throw new Error(`Unsupported language: ${language}`);
-    }
-
-    // 2. MR supports English Webcheck screening only.
-    if (group === 'MR' &&
-        (language !== 'en' || context.screeningType !== 'WEBCHECK')) {
-      throw new Error(
-        'MR supports English Webcheck screening only',
-      );
-    }
-
-    // 3. Select the appropriate adapter and service.
-    switch (context.screeningType) {
-      case 'WEBCHECK': {
-        const adapter =
-          this.webcheckAdapterFactory.getAdapter(
-            group,
-            language as Language,
-          );
-
-        const canonicalRequest =
-          await adapter.toCanonical(record);
-
-        const canonicalResponse =
-          await this.webcheckNetRevealService.webCheckScreen(
-            canonicalRequest,
-          );
-
-        return adapter.toResponse(canonicalResponse);
-      }
-
-      case 'PAYMENT': {
-        if (group !== 'ERGO') {
-          throw new Error(
-            'Payment screening is supported only for ERGO',
-          );
-        }
-
-        const adapter =
-          this.paymentAdapterFactory.getAdapter(
-            group,
-            language as Language,
-          );
-
-        const canonicalRequest =
-          await adapter.toCanonical(record);
-
-        const canonicalResponse =
-          await this.paymentNetRevealService.paymentScreen(
-            canonicalRequest,
-          );
-
-        return adapter.toResponse(canonicalResponse);
-      }
-
-      default:
-        throw new Error(
-          `Unsupported screening type: ${context.screeningType}`,
-        );
-    }
-  }
-}
-
-
-----------------
-
-import { ScreeningOrchestrator } from './ScreeningOrchestrator';
-
-import { WebcheckAdapterFactory } from
-  '../../modules/webcheck/adapters/webcheck-adapter.factory';
-
-import { PaymentAdapterFactory } from
-  '../../modules/payment/adapters/payment-adapter.factory';
-
-// Import your existing service and dependency classes.
-import { WebcheckScreeningService } from
-  '../../modules/webcheck/webcheck-screening.service';
-
-import { PaymentScreeningService } from
-  '../../modules/payment/payment-screening.service';
-
-import { NetRevealWebcheckScreeningClient } from
-  '../../modules/webcheck/netreveal-webcheck-screening.client';
-
-import { UndiciHttpClient } from
-  '../../infrastructure/http/undici-http-client';
-
-import { NetRevealAuthService } from
-  '../../modules/netreveal/netreveal-auth.service';
-
-import { WebcheckRequestMapper } from
-  '../../modules/webcheck/webcheck-request.mapper';
-
-import { WebcheckResponseMapper } from
-  '../../modules/webcheck/webcheck-response.mapper';
-
-// Import the actual payment dependencies from your project.
-
-export function createScreeningOrchestrator(): ScreeningOrchestrator {
-  const httpClient = new UndiciHttpClient(
-    env.NETREVEAL_BASE_URL,
-  );
-
-  const authService = new NetRevealAuthService();
-
-  const webcheckService = new WebcheckScreeningService(
-    new NetRevealWebcheckScreeningClient(
-      httpClient,
-      authService,
-    ),
-    new WebcheckRequestMapper(),
-    new WebcheckResponseMapper(),
-  );
-
-  const paymentService = new PaymentScreeningService(
-    // Add the same dependencies currently used
-    // by your PaymentScreeningService constructor.
-  );
-
-  return new ScreeningOrchestrator(
-    new WebcheckAdapterFactory(),
-    new PaymentAdapterFactory(),
-    webcheckService,
-    paymentService,
-  );
-}
-
-------------========
-export class BatchRecordProcessor {
-  private readonly screeningOrchestrator: ScreeningOrchestrator;
-
-  constructor() {
-    this.screeningOrchestrator = createScreeningOrchestrator();
+private normalizeCellValue(value: ExcelJS.CellValue): unknown {
+  if (value === null || value === undefined) {
+    return null;
   }
 
-  private async processRecord(batch: Batch, record: Record<string, unknown>) {
-    return this.screeningOrchestrator.screen(
-      {
-        group: batch.group,
-        screeningType: batch.screeningType,
-        language: batch.language,
-      },
-      record,
-    );
+  if (typeof value === 'object') {
+    // Resolve a shared-string reference if ExcelJS exposes one.
+    if ('sharedString' in value) {
+      const index = (value as { sharedString: number }).sharedString;
+      const sharedString = this.sharedStrings?.[index];
+
+      return sharedString === undefined
+        ? null
+        : this.normalizeCellValue(sharedString as ExcelJS.CellValue);
+    }
+
+    // Rich text
+    if ('richText' in value && Array.isArray(value.richText)) {
+      return value.richText.map((item) => item.text).join('').trim();
+    }
+
+    // Hyperlink
+    if ('text' in value) {
+      return String(value.text).trim();
+    }
+
+    // Formula
+    if ('result' in value) {
+      return value.result == null
+        ? null
+        : typeof value.result === 'string'
+          ? value.result.trim()
+          : value.result;
+    }
   }
+
+  return typeof value === 'string' ? value.trim() : value;
 }
