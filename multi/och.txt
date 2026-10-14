@@ -1,39 +1,308 @@
 
-private normalizeCellValue(value: ExcelJS.CellValue): unknown {
-  if (value === null || value === undefined) {
-    return null;
+import { Worker } from 'node:worker_threads';
+import os from 'node:os';
+import { randomUUID } from 'node:crypto';
+
+import {
+  BatchMessage,
+  BatchWorkerResult,
+} from '../dispatcher/batch-worker/batch.types';
+
+import { logger } from '../logger/logger';
+import { AppError } from '../utils/appError';
+import { env } from '../config/env';
+
+interface PendingJob {
+  resolve: (result: BatchWorkerResult) => void;
+  reject: (error: Error) => void;
+}
+
+interface WorkerSlot {
+  worker: Worker;
+  busy: boolean;
+  jobId?: string;
+  stopped: boolean;
+}
+
+interface QueuedJob {
+  jobId: string;
+  batch: BatchMessage;
+}
+
+interface WorkerResponse {
+  jobId: string;
+  result?: BatchWorkerResult;
+  error?: string;
+}
+
+const workerFile =
+  process.env.NODE_ENV === 'local'
+    ? './batch.worker.ts'
+    : './batch.worker.js';
+
+export class BatchWorkerManager {
+  private readonly workers: WorkerSlot[] = [];
+
+  private readonly pendingJobs = new Map<string, PendingJob>();
+
+  private readonly waitingJobs: QueuedJob[] = [];
+
+  private isShuttingDown = false;
+
+  constructor() {
+    const availableCpus = os.availableParallelism();
+
+    const configuredValue = Number(env.BATCH_WORKER_COUNT_OS ?? 2);
+
+    const configuredWorkers =
+      Number.isInteger(configuredValue) && configuredValue > 0
+        ? configuredValue
+        : 2;
+
+    const workerCount = Math.max(
+      1,
+      Math.min(configuredWorkers, availableCpus),
+    );
+
+    logger.info(
+      {
+        workerCount,
+        availableCpus,
+        configuredWorkers,
+      },
+      'Starting batch worker pool',
+    );
+
+    for (let i = 0; i < workerCount; i++) {
+      this.createWorker(i);
+    }
   }
 
-  if (typeof value === 'object') {
-    // Resolve a shared-string reference if ExcelJS exposes one.
-    if ('sharedString' in value) {
-      const index = (value as { sharedString: number }).sharedString;
-      const sharedString = this.sharedStrings?.[index];
+  private createWorker(index: number): void {
+    const worker = new Worker(require.resolve(workerFile), {
+      execArgv: ['-r', 'ts-node/register'],
+    });
 
-      return sharedString === undefined
-        ? null
-        : this.normalizeCellValue(sharedString as ExcelJS.CellValue);
+    const slot: WorkerSlot = {
+      worker,
+      busy: false,
+      stopped: false,
+    };
+
+    this.workers.push(slot);
+
+    logger.info(
+      { workerIndex: index },
+      'Batch worker created',
+    );
+
+    worker.on('message', (message: WorkerResponse) => {
+      this.handleWorkerMessage(message, slot);
+    });
+
+    worker.on('error', (error: Error) => {
+      logger.error(
+        {
+          workerIndex: index,
+          jobId: slot.jobId,
+          error: error.message,
+        },
+        'Batch worker error',
+      );
+
+      this.handleWorkerFailure(slot, error);
+    });
+
+    worker.on('exit', (code: number) => {
+      if (this.isShuttingDown || slot.stopped) {
+        return;
+      }
+
+      const error = new AppError(
+        `Batch worker exited unexpectedly with code ${code}`,
+      );
+
+      logger.error(
+        {
+          workerIndex: index,
+          code,
+          jobId: slot.jobId,
+        },
+        'Batch worker exited unexpectedly',
+      );
+
+      this.handleWorkerFailure(slot, error);
+    });
+  }
+
+  async execute(batch: BatchMessage): Promise<BatchWorkerResult> {
+    if (this.isShuttingDown) {
+      throw new AppError('Batch worker manager is shutting down');
     }
 
-    // Rich text
-    if ('richText' in value && Array.isArray(value.richText)) {
-      return value.richText.map((item) => item.text).join('').trim();
+    if (!this.workers.some((slot) => !slot.stopped)) {
+      throw new AppError('No healthy batch workers are available');
     }
 
-    // Hyperlink
-    if ('text' in value) {
-      return String(value.text).trim();
+    const jobId = randomUUID();
+
+    return new Promise<BatchWorkerResult>((resolve, reject) => {
+      this.pendingJobs.set(jobId, { resolve, reject });
+
+      this.waitingJobs.push({
+        jobId,
+        batch,
+      });
+
+      this.dispatchNext();
+    });
+  }
+
+  private dispatchNext(): void {
+    if (this.isShuttingDown) {
+      return;
     }
 
-    // Formula
-    if ('result' in value) {
-      return value.result == null
-        ? null
-        : typeof value.result === 'string'
-          ? value.result.trim()
-          : value.result;
+    for (const slot of this.workers) {
+      if (slot.busy || slot.stopped) {
+        continue;
+      }
+
+      const job = this.waitingJobs.shift();
+
+      if (!job) {
+        break;
+      }
+
+      slot.busy = true;
+      slot.jobId = job.jobId;
+
+      try {
+        slot.worker.postMessage(job);
+      } catch (error) {
+        slot.busy = false;
+        slot.jobId = undefined;
+
+        const pending = this.pendingJobs.get(job.jobId);
+
+        this.pendingJobs.delete(job.jobId);
+
+        pending?.reject(
+          error instanceof Error
+            ? error
+            : new AppError(String(error)),
+        );
+      }
+    }
+
+    // Don't leave jobs waiting forever if every worker has failed.
+    if (this.workers.every((slot) => slot.stopped)) {
+      const error = new AppError(
+        'All batch workers have stopped',
+      );
+
+      while (this.waitingJobs.length > 0) {
+        const job = this.waitingJobs.shift()!;
+        const pending = this.pendingJobs.get(job.jobId);
+
+        this.pendingJobs.delete(job.jobId);
+        pending?.reject(error);
+      }
     }
   }
 
-  return typeof value === 'string' ? value.trim() : value;
+  private handleWorkerMessage(
+    message: WorkerResponse,
+    slot: WorkerSlot,
+  ): void {
+    // Ignore stale or unexpected responses.
+    if (slot.jobId !== message.jobId) {
+      logger.warn(
+        { jobId: message.jobId, currentJobId: slot.jobId },
+        'Unexpected batch worker response',
+      );
+      return;
+    }
+
+    const pending = this.pendingJobs.get(message.jobId);
+
+    // Release the slot regardless of whether the job succeeded.
+    slot.busy = false;
+    slot.jobId = undefined;
+
+    if (pending) {
+      this.pendingJobs.delete(message.jobId);
+
+      if (message.error) {
+        pending.reject(new AppError(message.error));
+      } else if (message.result === undefined) {
+        pending.reject(
+          new AppError('Worker returned an empty result'),
+        );
+      } else {
+        pending.resolve(message.result);
+      }
+    }
+
+    // Dispatch the next waiting batch after success or failure.
+    this.dispatchNext();
+  }
+
+  private handleWorkerFailure(
+    slot: WorkerSlot,
+    error: Error,
+  ): void {
+    // The error event and exit event can both fire for one worker.
+    if (slot.stopped) {
+      return;
+    }
+
+    slot.stopped = true;
+
+    const failedJobId = slot.jobId;
+
+    slot.busy = false;
+    slot.jobId = undefined;
+
+    if (failedJobId) {
+      const pending = this.pendingJobs.get(failedJobId);
+
+      if (pending) {
+        this.pendingJobs.delete(failedJobId);
+        pending.reject(error);
+      }
+    }
+
+    // Continue with healthy workers, if any.
+    this.dispatchNext();
+  }
+
+  async shutdown(): Promise<void> {
+    if (this.isShuttingDown) {
+      return;
+    }
+
+    this.isShuttingDown = true;
+
+    const error = new AppError(
+      'Batch worker manager is shutting down',
+    );
+
+    for (const pending of this.pendingJobs.values()) {
+      pending.reject(error);
+    }
+
+    this.pendingJobs.clear();
+    this.waitingJobs.length = 0;
+
+    for (const slot of this.workers) {
+      slot.stopped = true;
+    }
+
+    await Promise.all(
+      this.workers.map((slot) => slot.worker.terminate()),
+    );
+
+    logger.info('Batch worker pool shut down');
+  }
 }
