@@ -1,30 +1,3 @@
-
-export type XmlObject = Record<string, unknown>;
-
-export class SoapStructureError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'SoapStructureError';
-  }
-}
-
-const SOAP_NAMESPACES = new Set([
-  'http://schemas.xmlsoap.org/soap/envelope/', // SOAP 1.1
-  'http://www.w3.org/2003/05/soap-envelope',   // SOAP 1.2
-]);
-
-function isObject(value: unknown): value is XmlObject {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    !Array.isArray(value)
-  );
-}
-
-function getLocalName(name: string): string {
-  return name.split(':').pop() ?? name;
-}
-
 function getSingleChild(
   parent: XmlObject,
   localName: string,
@@ -39,118 +12,26 @@ function getSingleChild(
     );
   }
 
-  return {
-    name: matches[0][0],
-    value: matches[0][1],
-  };
-}
+  const match = matches[0];
 
-function getNamespace(
-  element: XmlObject,
-  qualifiedName: string,
-): string | undefined {
-  const prefix = qualifiedName.includes(':')
-    ? qualifiedName.split(':')[0]
-    : '';
-
-  const namespaceKey = prefix
-    ? `@_xmlns:${prefix}`
-    : '@_xmlns';
-
-  const value = element[namespaceKey];
-
-  return typeof value === 'string' ? value : undefined;
-}
-
-export class SoapEnvelopeService {
-  extractOperation(
-    parsedXml: XmlObject,
-    expectedOperation: string,
-    expectedOperationNamespace?: string,
-  ): XmlObject {
-    // 1. Validate the root Envelope.
-    const envelopeEntry = getSingleChild(
-      parsedXml,
-      'Envelope',
+  if (!match) {
+    throw new SoapStructureError(
+      `Missing ${localName} element`,
     );
-
-    if (!isObject(envelopeEntry.value)) {
-      throw new SoapStructureError(
-        'SOAP Envelope must be an XML element',
-      );
-    }
-
-    const envelope = envelopeEntry.value;
-
-    // 2. Validate the SOAP namespace.
-    const soapNamespace = getNamespace(
-      envelope,
-      envelopeEntry.name,
-    );
-
-    if (
-      !soapNamespace ||
-      !SOAP_NAMESPACES.has(soapNamespace)
-    ) {
-      throw new SoapStructureError(
-        'Invalid or unsupported SOAP namespace',
-      );
-    }
-
-    // 3. Find exactly one SOAP Body.
-    const bodyEntry = getSingleChild(envelope, 'Body');
-
-    if (!isObject(bodyEntry.value)) {
-      throw new SoapStructureError(
-        'SOAP Body must be an XML element',
-      );
-    }
-
-    const body = bodyEntry.value;
-
-    // 4. Find exactly one operation element.
-    const operationEntries = Object.entries(body).filter(
-      ([key]) =>
-        !key.startsWith('@_') &&
-        !key.startsWith('#') &&
-        !key.startsWith('?'),
-    );
-
-    if (operationEntries.length !== 1) {
-      throw new SoapStructureError(
-        'SOAP Body must contain exactly one operation',
-      );
-    }
-
-    const [operationName, operationValue] =
-      operationEntries[0];
-
-    if (getLocalName(operationName) !== expectedOperation) {
-      throw new SoapStructureError(
-        `Unexpected SOAP operation: ${getLocalName(operationName)}`,
-      );
-    }
-
-    if (!isObject(operationValue)) {
-      throw new SoapStructureError(
-        'SOAP operation payload must be an XML element',
-      );
-    }
-
-    // 5. Optionally validate the operation namespace.
-    if (expectedOperationNamespace) {
-      const actualNamespace = getNamespace(
-        operationValue,
-        operationName,
-      );
-
-      if (actualNamespace !== expectedOperationNamespace) {
-        throw new SoapStructureError(
-          'Invalid SOAP operation namespace',
-        );
-      }
-    }
-
-    return operationValue;
   }
+
+  const [name, value] = match;
+
+  return { name, value };
 }
+
+
+const operationEntry = operationEntries[0];
+
+if (!operationEntry) {
+  throw new SoapStructureError(
+    'SOAP Body operation is missing',
+  );
+}
+
+const [operationName, operationValue] = operationEntry;
