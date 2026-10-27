@@ -1,308 +1,156 @@
 
-import { Worker } from 'node:worker_threads';
-import os from 'node:os';
-import { randomUUID } from 'node:crypto';
+export type XmlObject = Record<string, unknown>;
 
-import {
-  BatchMessage,
-  BatchWorkerResult,
-} from '../dispatcher/batch-worker/batch.types';
-
-import { logger } from '../logger/logger';
-import { AppError } from '../utils/appError';
-import { env } from '../config/env';
-
-interface PendingJob {
-  resolve: (result: BatchWorkerResult) => void;
-  reject: (error: Error) => void;
+export class SoapStructureError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SoapStructureError';
+  }
 }
 
-interface WorkerSlot {
-  worker: Worker;
-  busy: boolean;
-  jobId?: string;
-  stopped: boolean;
+const SOAP_NAMESPACES = new Set([
+  'http://schemas.xmlsoap.org/soap/envelope/', // SOAP 1.1
+  'http://www.w3.org/2003/05/soap-envelope',   // SOAP 1.2
+]);
+
+function isObject(value: unknown): value is XmlObject {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value)
+  );
 }
 
-interface QueuedJob {
-  jobId: string;
-  batch: BatchMessage;
+function getLocalName(name: string): string {
+  return name.split(':').pop() ?? name;
 }
 
-interface WorkerResponse {
-  jobId: string;
-  result?: BatchWorkerResult;
-  error?: string;
-}
+function getSingleChild(
+  parent: XmlObject,
+  localName: string,
+): { name: string; value: unknown } {
+  const matches = Object.entries(parent).filter(
+    ([key]) => getLocalName(key) === localName,
+  );
 
-const workerFile =
-  process.env.NODE_ENV === 'local'
-    ? './batch.worker.ts'
-    : './batch.worker.js';
-
-export class BatchWorkerManager {
-  private readonly workers: WorkerSlot[] = [];
-
-  private readonly pendingJobs = new Map<string, PendingJob>();
-
-  private readonly waitingJobs: QueuedJob[] = [];
-
-  private isShuttingDown = false;
-
-  constructor() {
-    const availableCpus = os.availableParallelism();
-
-    const configuredValue = Number(env.BATCH_WORKER_COUNT_OS ?? 2);
-
-    const configuredWorkers =
-      Number.isInteger(configuredValue) && configuredValue > 0
-        ? configuredValue
-        : 2;
-
-    const workerCount = Math.max(
-      1,
-      Math.min(configuredWorkers, availableCpus),
+  if (matches.length !== 1) {
+    throw new SoapStructureError(
+      `Expected exactly one ${localName} element`,
     );
-
-    logger.info(
-      {
-        workerCount,
-        availableCpus,
-        configuredWorkers,
-      },
-      'Starting batch worker pool',
-    );
-
-    for (let i = 0; i < workerCount; i++) {
-      this.createWorker(i);
-    }
   }
 
-  private createWorker(index: number): void {
-    const worker = new Worker(require.resolve(workerFile), {
-      execArgv: ['-r', 'ts-node/register'],
-    });
+  return {
+    name: matches[0][0],
+    value: matches[0][1],
+  };
+}
 
-    const slot: WorkerSlot = {
-      worker,
-      busy: false,
-      stopped: false,
-    };
+function getNamespace(
+  element: XmlObject,
+  qualifiedName: string,
+): string | undefined {
+  const prefix = qualifiedName.includes(':')
+    ? qualifiedName.split(':')[0]
+    : '';
 
-    this.workers.push(slot);
+  const namespaceKey = prefix
+    ? `@_xmlns:${prefix}`
+    : '@_xmlns';
 
-    logger.info(
-      { workerIndex: index },
-      'Batch worker created',
+  const value = element[namespaceKey];
+
+  return typeof value === 'string' ? value : undefined;
+}
+
+export class SoapEnvelopeService {
+  extractOperation(
+    parsedXml: XmlObject,
+    expectedOperation: string,
+    expectedOperationNamespace?: string,
+  ): XmlObject {
+    // 1. Validate the root Envelope.
+    const envelopeEntry = getSingleChild(
+      parsedXml,
+      'Envelope',
     );
 
-    worker.on('message', (message: WorkerResponse) => {
-      this.handleWorkerMessage(message, slot);
-    });
-
-    worker.on('error', (error: Error) => {
-      logger.error(
-        {
-          workerIndex: index,
-          jobId: slot.jobId,
-          error: error.message,
-        },
-        'Batch worker error',
+    if (!isObject(envelopeEntry.value)) {
+      throw new SoapStructureError(
+        'SOAP Envelope must be an XML element',
       );
-
-      this.handleWorkerFailure(slot, error);
-    });
-
-    worker.on('exit', (code: number) => {
-      if (this.isShuttingDown || slot.stopped) {
-        return;
-      }
-
-      const error = new AppError(
-        `Batch worker exited unexpectedly with code ${code}`,
-      );
-
-      logger.error(
-        {
-          workerIndex: index,
-          code,
-          jobId: slot.jobId,
-        },
-        'Batch worker exited unexpectedly',
-      );
-
-      this.handleWorkerFailure(slot, error);
-    });
-  }
-
-  async execute(batch: BatchMessage): Promise<BatchWorkerResult> {
-    if (this.isShuttingDown) {
-      throw new AppError('Batch worker manager is shutting down');
     }
 
-    if (!this.workers.some((slot) => !slot.stopped)) {
-      throw new AppError('No healthy batch workers are available');
+    const envelope = envelopeEntry.value;
+
+    // 2. Validate the SOAP namespace.
+    const soapNamespace = getNamespace(
+      envelope,
+      envelopeEntry.name,
+    );
+
+    if (
+      !soapNamespace ||
+      !SOAP_NAMESPACES.has(soapNamespace)
+    ) {
+      throw new SoapStructureError(
+        'Invalid or unsupported SOAP namespace',
+      );
     }
 
-    const jobId = randomUUID();
+    // 3. Find exactly one SOAP Body.
+    const bodyEntry = getSingleChild(envelope, 'Body');
 
-    return new Promise<BatchWorkerResult>((resolve, reject) => {
-      this.pendingJobs.set(jobId, { resolve, reject });
-
-      this.waitingJobs.push({
-        jobId,
-        batch,
-      });
-
-      this.dispatchNext();
-    });
-  }
-
-  private dispatchNext(): void {
-    if (this.isShuttingDown) {
-      return;
+    if (!isObject(bodyEntry.value)) {
+      throw new SoapStructureError(
+        'SOAP Body must be an XML element',
+      );
     }
 
-    for (const slot of this.workers) {
-      if (slot.busy || slot.stopped) {
-        continue;
-      }
+    const body = bodyEntry.value;
 
-      const job = this.waitingJobs.shift();
+    // 4. Find exactly one operation element.
+    const operationEntries = Object.entries(body).filter(
+      ([key]) =>
+        !key.startsWith('@_') &&
+        !key.startsWith('#') &&
+        !key.startsWith('?'),
+    );
 
-      if (!job) {
-        break;
-      }
+    if (operationEntries.length !== 1) {
+      throw new SoapStructureError(
+        'SOAP Body must contain exactly one operation',
+      );
+    }
 
-      slot.busy = true;
-      slot.jobId = job.jobId;
+    const [operationName, operationValue] =
+      operationEntries[0];
 
-      try {
-        slot.worker.postMessage(job);
-      } catch (error) {
-        slot.busy = false;
-        slot.jobId = undefined;
+    if (getLocalName(operationName) !== expectedOperation) {
+      throw new SoapStructureError(
+        `Unexpected SOAP operation: ${getLocalName(operationName)}`,
+      );
+    }
 
-        const pending = this.pendingJobs.get(job.jobId);
+    if (!isObject(operationValue)) {
+      throw new SoapStructureError(
+        'SOAP operation payload must be an XML element',
+      );
+    }
 
-        this.pendingJobs.delete(job.jobId);
+    // 5. Optionally validate the operation namespace.
+    if (expectedOperationNamespace) {
+      const actualNamespace = getNamespace(
+        operationValue,
+        operationName,
+      );
 
-        pending?.reject(
-          error instanceof Error
-            ? error
-            : new AppError(String(error)),
+      if (actualNamespace !== expectedOperationNamespace) {
+        throw new SoapStructureError(
+          'Invalid SOAP operation namespace',
         );
       }
     }
 
-    // Don't leave jobs waiting forever if every worker has failed.
-    if (this.workers.every((slot) => slot.stopped)) {
-      const error = new AppError(
-        'All batch workers have stopped',
-      );
-
-      while (this.waitingJobs.length > 0) {
-        const job = this.waitingJobs.shift()!;
-        const pending = this.pendingJobs.get(job.jobId);
-
-        this.pendingJobs.delete(job.jobId);
-        pending?.reject(error);
-      }
-    }
-  }
-
-  private handleWorkerMessage(
-    message: WorkerResponse,
-    slot: WorkerSlot,
-  ): void {
-    // Ignore stale or unexpected responses.
-    if (slot.jobId !== message.jobId) {
-      logger.warn(
-        { jobId: message.jobId, currentJobId: slot.jobId },
-        'Unexpected batch worker response',
-      );
-      return;
-    }
-
-    const pending = this.pendingJobs.get(message.jobId);
-
-    // Release the slot regardless of whether the job succeeded.
-    slot.busy = false;
-    slot.jobId = undefined;
-
-    if (pending) {
-      this.pendingJobs.delete(message.jobId);
-
-      if (message.error) {
-        pending.reject(new AppError(message.error));
-      } else if (message.result === undefined) {
-        pending.reject(
-          new AppError('Worker returned an empty result'),
-        );
-      } else {
-        pending.resolve(message.result);
-      }
-    }
-
-    // Dispatch the next waiting batch after success or failure.
-    this.dispatchNext();
-  }
-
-  private handleWorkerFailure(
-    slot: WorkerSlot,
-    error: Error,
-  ): void {
-    // The error event and exit event can both fire for one worker.
-    if (slot.stopped) {
-      return;
-    }
-
-    slot.stopped = true;
-
-    const failedJobId = slot.jobId;
-
-    slot.busy = false;
-    slot.jobId = undefined;
-
-    if (failedJobId) {
-      const pending = this.pendingJobs.get(failedJobId);
-
-      if (pending) {
-        this.pendingJobs.delete(failedJobId);
-        pending.reject(error);
-      }
-    }
-
-    // Continue with healthy workers, if any.
-    this.dispatchNext();
-  }
-
-  async shutdown(): Promise<void> {
-    if (this.isShuttingDown) {
-      return;
-    }
-
-    this.isShuttingDown = true;
-
-    const error = new AppError(
-      'Batch worker manager is shutting down',
-    );
-
-    for (const pending of this.pendingJobs.values()) {
-      pending.reject(error);
-    }
-
-    this.pendingJobs.clear();
-    this.waitingJobs.length = 0;
-
-    for (const slot of this.workers) {
-      slot.stopped = true;
-    }
-
-    await Promise.all(
-      this.workers.map((slot) => slot.worker.terminate()),
-    );
-
-    logger.info('Batch worker pool shut down');
+    return operationValue;
   }
 }
