@@ -2,102 +2,69 @@
 import type { FastifyPluginAsync } from 'fastify';
 
 import {
-  SoapParserService,
-  SoapXmlParseError,
-} from '../../../shared/soap/soap-parser.service.js';
-
-import {
-  SoapEnvelopeService,
-  SoapStructureError,
-} from '../../../shared/soap/soap-envelope.service.js';
-
-import {
   validateCheckRequest,
 } from '../schemas/check.schema.js';
 
-import type {
-  CheckRequest,
-} from '../schemas/check.schema.js';
-
-interface CheckRouteDependencies {
-  soapParser: SoapParserService;
-  soapEnvelope: SoapEnvelopeService;
-
-  // Connect your existing adapter and screening flow here.
-  handleCheck: (
-    request: CheckRequest,
-  ) => Promise<unknown>;
-}
-
-export function createCheckRoute(
-  dependencies: CheckRouteDependencies,
-): FastifyPluginAsync {
-  return async (fastify) => {
-    fastify.post('/check', async (request, reply) => {
-      try {
-        // 1. Fastify plugin provides raw XML as a string.
-        if (typeof request.body !== 'string') {
-          return reply.code(400).send({
-            message: 'Expected a SOAP XML request',
-          });
-        }
-
-        const xml = request.body;
-
-        // 2. Validate XML syntax and convert it to an object.
-        const parsedXml = dependencies.soapParser.parse(xml);
-
-        // 3. Extract the expected SOAP operation.
-        const checkPayload =
-          dependencies.soapEnvelope.extractOperation(
-            parsedXml,
-            'check',
-          );
-
-        // 4. Validate API-specific fields.
-        if (!validateCheckRequest(checkPayload)) {
-          request.log.warn(
-            {
-              errors: validateCheckRequest.errors,
-            },
-            'Partner check request validation failed',
-          );
-
-          return reply.code(400).send({
-            message: 'Invalid check request',
-            errors: validateCheckRequest.errors,
-          });
-        }
-
-        // 5. Pass the validated payload to your
-        // adapter, canonical mapping and screening flow.
-        const result = await dependencies.handleCheck(
-          checkPayload,
-        );
-
-        // Temporary JSON response.
-        // Replace with SOAP response serialization
-        // when we implement the response mapper.
-        return reply.code(200).send(result);
-      } catch (error) {
-        if (
-          error instanceof SoapXmlParseError ||
-          error instanceof SoapStructureError
-        ) {
-          return reply.code(400).send({
-            message: error.message,
-          });
-        }
-
-        request.log.error(
-          { err: error },
-          'Partner screening request failed',
-        );
-
-        return reply.code(500).send({
-          message: 'Partner screening request failed',
+const checkRoute: FastifyPluginAsync = async (fastify) => {
+  fastify.post('/check', async (request, reply) => {
+    try {
+      // 1. Receive raw XML from the content-type parser.
+      if (typeof request.body !== 'string') {
+        return reply.code(400).send({
+          message: 'Expected a SOAP XML request',
         });
       }
-    });
-  };
-}
+
+      // 2. Parse and validate XML syntax.
+      const parsedXml = fastify.soapParser.parse(
+        request.body,
+      );
+
+      // 3. Extract the expected SOAP operation.
+      const checkPayload =
+        fastify.soapEnvelope.extractOperation(
+          parsedXml,
+          'check',
+        );
+
+      // 4. Validate this API's fields.
+      if (!validateCheckRequest(checkPayload)) {
+        return reply.code(400).send({
+          message: 'Invalid check request',
+          errors: validateCheckRequest.errors,
+        });
+      }
+
+      // 5. Next: call your existing adapter,
+      // canonical model and screening orchestrator.
+      // We will connect these using your actual services.
+
+      return reply.code(501).send({
+        message: 'Screening handler not connected yet',
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        (
+          error.name === 'SoapXmlParseError' ||
+          error.name === 'SoapStructureError'
+        )
+      ) {
+        return reply.code(400).send({
+          message: error.message,
+        });
+      }
+
+      request.log.error(
+        { err: error },
+        'Partner screening request failed',
+      );
+
+      return reply.code(500).send({
+        message: 'Internal server error',
+      });
+    }
+  });
+};
+
+export default checkRoute;
